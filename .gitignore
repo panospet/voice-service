@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Bootstrap (downloaded manually, not part of the project)
+get-pip.py
