@@ -16,6 +16,7 @@ Runs on stdlib http.server (no web framework). Install: pip install -r requireme
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,7 +32,10 @@ DEFAULT_RATE = os.getenv("TTS_RATE", "+0%")
 DEFAULT_PITCH = os.getenv("TTS_PITCH", "+0Hz")
 DEFAULT_VOLUME = os.getenv("TTS_VOLUME", "+0%")
 
-CHUNK_CHARS = 2000  # split long text into chunks the service can handle
+# On-disk cache keyed by content hash, so retries/re-runs don't re-synthesize.
+CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/voice-cache")
+
+CHUNK_CHARS = 1000  # split long text into small chunks the service handles reliably
 
 
 def split_chunks(text, size):
@@ -58,13 +62,42 @@ def split_chunks(text, size):
 
 
 async def synth(text, voice, rate, pitch, volume):
+    key = hashlib.sha256(f"{text}|{voice}|{rate}|{pitch}|{volume}".encode("utf-8")).hexdigest()
+    cache_path = os.path.join(CACHE_DIR, key + ".mp3")
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            return f.read()
+
     out = bytearray()
     for chunk in split_chunks(text, CHUNK_CHARS):
-        communicate = edge_tts.Communicate(chunk, voice=voice, rate=rate, pitch=pitch, volume=volume)
-        async for piece in communicate.stream():
-            if piece["type"] == "audio":
-                out.extend(piece["data"])
-    return bytes(out)
+        # Retry each chunk with backoff — the service intermittently returns
+        # "no audio" under load, and a short retry usually succeeds.
+        last_err = None
+        for attempt in range(3):
+            try:
+                communicate = edge_tts.Communicate(
+                    chunk, voice=voice, rate=rate, pitch=pitch, volume=volume
+                )
+                async for piece in communicate.stream():
+                    if piece["type"] == "audio":
+                        out.extend(piece["data"])
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
+        if last_err is not None:
+            raise last_err
+        await asyncio.sleep(0.8)  # gentle pacing between chunks
+
+    audio = bytes(out)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = cache_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(audio)
+    os.replace(tmp, cache_path)
+    return audio
 
 
 def extract_article(url):
