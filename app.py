@@ -19,6 +19,9 @@ import base64
 import hashlib
 import json
 import os
+import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import edge_tts
@@ -27,20 +30,30 @@ import trafilatura
 AUTH_USER = os.getenv("AUTH_USERNAME", "")
 AUTH_PASS = os.getenv("AUTH_PASSWORD", "")
 
-DEFAULT_VOICE = os.getenv("TTS_VOICE", "el-GR-AthinaNeural")
+DEFAULT_VOICE = os.getenv("TTS_VOICE", "el-GR-NestorasNeural")
 DEFAULT_RATE = os.getenv("TTS_RATE", "+0%")
 DEFAULT_PITCH = os.getenv("TTS_PITCH", "+0Hz")
 DEFAULT_VOLUME = os.getenv("TTS_VOLUME", "+0%")
 
 # On-disk cache keyed by content hash, so retries/re-runs don't re-synthesize.
 CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/voice-cache")
+CACHE_RETENTION_DAYS = int(os.getenv("CACHE_RETENTION_DAYS", "30"))
 
 CHUNK_CHARS = 1000  # split long text into small chunks the service handles reliably
 
+_last_prune_ts = 0.0
+_prune_lock = threading.Lock()
+
+
+def log_err(msg):
+    print(msg, file=sys.stderr, flush=True)
+
 
 def split_chunks(text, size):
-    """Split text into chunks of at most `size` chars, preferring sentence breaks."""
+    """Split text into non-empty chunks of at most `size` chars, preferring sentence breaks."""
     text = text.strip()
+    if not text:
+        return []
     if len(text) <= size:
         return [text]
     chunks = []
@@ -48,55 +61,115 @@ def split_chunks(text, size):
     while start < len(text):
         end = start + size
         if end >= len(text):
-            chunks.append(text[start:])
+            tail = text[start:].strip()
+            if tail:
+                chunks.append(tail)
             break
-        window = start + int(size * 0.8)
-        cut = end
+        window = start + int(size * 0.5)
+        cut = 0
         for i in range(end, window, -1):
             if text[i - 1] in ".!?;…\n":
                 cut = i
                 break
-        chunks.append(text[start:cut])
+        if cut == 0:
+            for i in range(end, window, -1):
+                if text[i - 1].isspace():
+                    cut = i
+                    break
+        if cut == 0:
+            cut = end
+        piece = text[start:cut].strip()
+        if piece:
+            chunks.append(piece)
         start = cut
     return chunks
+
+
+def maybe_prune_cache():
+    """Remove cached MP3 files older than CACHE_RETENTION_DAYS (at most once per hour)."""
+    global _last_prune_ts
+    if CACHE_RETENTION_DAYS <= 0:
+        return
+    now = time.time()
+    if now - _last_prune_ts < 3600:
+        return
+    with _prune_lock:
+        if now - _last_prune_ts < 3600:
+            return
+        _last_prune_ts = now
+        cutoff = now - (CACHE_RETENTION_DAYS * 86400)
+        try:
+            for name in os.listdir(CACHE_DIR):
+                if not name.endswith(".mp3"):
+                    continue
+                path = os.path.join(CACHE_DIR, name)
+                try:
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                except OSError:
+                    pass
+        except OSError:
+            pass
 
 
 async def synth(text, voice, rate, pitch, volume):
     key = hashlib.sha256(f"{text}|{voice}|{rate}|{pitch}|{volume}".encode("utf-8")).hexdigest()
     cache_path = os.path.join(CACHE_DIR, key + ".mp3")
     if os.path.exists(cache_path):
-        with open(cache_path, "rb") as f:
-            return f.read()
+        try:
+            with open(cache_path, "rb") as f:
+                cached = f.read()
+            if cached:
+                return cached
+        except OSError:
+            pass
+
+    chunks = split_chunks(text, CHUNK_CHARS)
+    if not chunks:
+        raise ValueError("no text to synthesize")
 
     out = bytearray()
-    for chunk in split_chunks(text, CHUNK_CHARS):
+    for idx, chunk in enumerate(chunks):
+        if idx > 0:
+            await asyncio.sleep(0.8)  # gentle pacing between chunks
         # Retry each chunk with backoff — the service intermittently returns
         # "no audio" under load, and a short retry usually succeeds.
         last_err = None
+        chunk_buf = bytearray()
         for attempt in range(3):
+            chunk_buf.clear()
             try:
                 communicate = edge_tts.Communicate(
                     chunk, voice=voice, rate=rate, pitch=pitch, volume=volume
                 )
                 async for piece in communicate.stream():
                     if piece["type"] == "audio":
-                        out.extend(piece["data"])
+                        chunk_buf.extend(piece["data"])
+                if not chunk_buf:
+                    raise RuntimeError("edge-tts returned 0 audio bytes")
                 last_err = None
                 break
             except Exception as exc:
                 last_err = exc
+                log_err(
+                    f"[voice-service] chunk {idx + 1}/{len(chunks)} attempt {attempt + 1}/3 failed: {exc}"
+                )
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)  # 1s, 2s backoff
         if last_err is not None:
             raise last_err
-        await asyncio.sleep(0.8)  # gentle pacing between chunks
+        out.extend(chunk_buf)
+
+    if not out:
+        raise RuntimeError("synthesis produced 0 audio bytes")
 
     audio = bytes(out)
     os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = cache_path + ".tmp"
+    tmp = f"{cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
     with open(tmp, "wb") as f:
         f.write(audio)
     os.replace(tmp, cache_path)
+    maybe_prune_cache()
     return audio
 
 
