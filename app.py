@@ -9,7 +9,8 @@ Request (JSON):
 
 Response: audio/mpeg bytes (24 kHz). Errors are JSON.
 
-Auth: HTTP Basic (AUTH_USERNAME / AUTH_PASSWORD env). If either is unset, auth is off.
+Auth: HTTP Basic (AUTH_USERNAME / AUTH_PASSWORD env). Fails closed at startup unless
+ALLOW_UNAUTHENTICATED=true is explicitly set.
 
 Runs on stdlib http.server (no web framework). Install: pip install -r requirements.txt
 """
@@ -17,18 +18,23 @@ Runs on stdlib http.server (no web framework). Install: pip install -r requireme
 import asyncio
 import base64
 import hashlib
+import hmac
+import ipaddress
 import json
 import os
+import socket
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import edge_tts
 import trafilatura
 
 AUTH_USER = os.getenv("AUTH_USERNAME", "")
 AUTH_PASS = os.getenv("AUTH_PASSWORD", "")
+ALLOW_UNAUTHENTICATED = os.getenv("ALLOW_UNAUTHENTICATED", "").lower() in ("1", "true", "yes")
 
 DEFAULT_VOICE = os.getenv("TTS_VOICE", "el-GR-NestorasNeural")
 DEFAULT_RATE = os.getenv("TTS_RATE", "+0%")
@@ -40,6 +46,8 @@ CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/voice-cache")
 CACHE_RETENTION_DAYS = int(os.getenv("CACHE_RETENTION_DAYS", "30"))
 
 CHUNK_CHARS = 1000  # split long text into small chunks the service handles reliably
+MAX_BODY_BYTES = 64 * 1024
+MAX_TEXT_CHARS = 20000
 
 _last_prune_ts = 0.0
 _prune_lock = threading.Lock()
@@ -173,8 +181,40 @@ async def synth(text, voice, rate, pitch, volume):
     return audio
 
 
+def validate_public_url(url):
+    """Validate that url uses http/https and does not resolve to private/loopback IPs."""
+    if not url or not isinstance(url, str):
+        raise ValueError("missing URL")
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("URL scheme must be http or https")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL missing hostname")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    except socket.gaierror as exc:
+        raise ValueError(f"could not resolve host {host}: {exc}") from exc
+    if not infos:
+        raise ValueError(f"could not resolve host {host}")
+    for info in infos:
+        addr_str = info[4][0]
+        ip = ipaddress.ip_address(addr_str)
+        if (
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"disallowed target IP address for host {host}")
+    return url.strip()
+
+
 def extract_article(url):
-    downloaded = trafilatura.fetch_url(url)
+    safe_url = validate_public_url(url)
+    downloaded = trafilatura.fetch_url(safe_url)
     if not downloaded:
         raise ValueError("could not fetch article at URL")
     body = trafilatura.extract(downloaded, include_comments=False, include_tables=False) or ""
@@ -191,12 +231,18 @@ def extract_article(url):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass  # quieter logs
+    timeout = 30
+
+    def log_message(self, fmt, *args):
+        # Keep healthz checks quiet; log errors or non-200 responses.
+        pass
 
     def check_auth(self):
-        if not AUTH_USER or not AUTH_PASS:
+        if ALLOW_UNAUTHENTICATED and (not AUTH_USER or not AUTH_PASS):
             return True
+        if not AUTH_USER or not AUTH_PASS:
+            self.send_json(500, {"error": "server authentication not configured"})
+            return False
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Basic "):
             self.send_json(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Basic"})
@@ -207,15 +253,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self.send_json(401, {"error": "unauthorized"})
             return False
-        if u != AUTH_USER or p != AUTH_PASS:
+        if not (hmac.compare_digest(u, AUTH_USER) and hmac.compare_digest(p, AUTH_PASS)):
             self.send_json(401, {"error": "unauthorized"})
             return False
         return True
 
     def send_json(self, status, obj, extra_headers=None):
+        if status >= 400 and status != 401:
+            log_err(f"[voice-service] HTTP {status} {self.path}: {obj}")
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         if extra_headers:
             for k, v in extra_headers.items():
@@ -238,7 +287,19 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            self.send_json(400, {"error": "invalid Content-Length"})
+            return
+
+        if length < 0 or length > MAX_BODY_BYTES:
+            self.send_json(413, {"error": f"request body too large (max {MAX_BODY_BYTES} bytes)"})
+            return
+
+        try:
+            raw_body = self.rfile.read(length) if length > 0 else b"{}"
+            body = json.loads(raw_body)
+            if not isinstance(body, dict):
+                raise ValueError("JSON body must be an object")
         except Exception:
             self.send_json(400, {"error": "invalid JSON body"})
             return
@@ -251,6 +312,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if typ == "text":
             text = body.get("text", "")
+            if not isinstance(text, str):
+                self.send_json(400, {"error": "text must be a string"})
+                return
         elif typ == "url":
             try:
                 text = extract_article(body.get("url", ""))
@@ -265,6 +329,9 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self.send_json(400, {"error": "no text to synthesize"})
             return
+        if len(text) > MAX_TEXT_CHARS:
+            self.send_json(400, {"error": f"text too long (max {MAX_TEXT_CHARS} characters)"})
+            return
 
         try:
             audio = asyncio.run(synth(text, voice, rate, pitch, volume))
@@ -274,16 +341,20 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "audio/mpeg")
-        self.send_header("Content-Length", str(len(audio)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(len_bytes := audio)))
         self.end_headers()
-        self.wfile.write(audio)
+        self.wfile.write(len_bytes)
 
 
 def main():
+    if not ALLOW_UNAUTHENTICATED and (not AUTH_USER or not AUTH_PASS):
+        log_err("FATAL: AUTH_USERNAME and AUTH_PASSWORD must be set in the environment")
+        sys.exit(1)
     port = int(os.getenv("VOICE_PORT", "8002"))
     bind = os.getenv("VOICE_BIND", "127.0.0.1")
     server = ThreadingHTTPServer((bind, port), Handler)
-    print(f"voice-service listening on http://{bind}:{port}")
+    print(f"voice-service listening on http://{bind}:{port}", flush=True)
     server.serve_forever()
 
 
