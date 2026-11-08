@@ -1,0 +1,11 @@
+.git
+.gitignore
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+get-pip.py
+test_app.py
+*.md
