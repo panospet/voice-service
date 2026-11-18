@@ -1,0 +1,20 @@
+# voice-service — standalone deployment
+services:
+  voice-service:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Athens
+      - VOICE_BIND=0.0.0.0
+      - VOICE_PORT=8002
+      - TTS_VOICE=${TTS_VOICE:-el-GR-NestorasNeural}
+      - CACHE_DIR=/app/cache
+      - AUTH_USERNAME=${AUTH_USERNAME}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
+    ports:
+      - "${VOICE_BIND_ADDR:-127.0.0.1}:${VOICE_PORT:-8002}:8002"
+    volumes:
+      - voice-cache:/app/cache
+
+volumes:
+  voice-cache:
